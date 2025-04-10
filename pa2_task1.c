@@ -26,6 +26,7 @@ Please specify the group members here
 */
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -97,7 +98,7 @@ void *client_thread_func(void *arg) {
         return NULL; //Exit client thread
     }
 
-    data->socket_fd = socket(AF_INET, SOCK_STREAM, 0); //Socket creation
+    data->socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_UDP); //Socket creation
 
     //If socket is not created exit the thread
     if (data->socket_fd < 0) {
@@ -294,7 +295,7 @@ void run_server() {
     server_addr.sin_addr.s_addr = inet_addr(server_ip);
     server_addr.sin_port = htons(server_port);
 
-    server_socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    server_socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
 
     if (server_socket_fd < 0) {
         perror("Failure to create socket");
@@ -312,8 +313,8 @@ void run_server() {
     }
 
     // Set socket fd as nonblocking
-    fcntl(server_socket_fd, F_SETFL,
-          fcntl(server_socket_fd, F_GETFL, 0) | O_NONBLOCK);
+    /* fcntl(server_socket_fd, F_SETFL, */
+    /*       fcntl(server_socket_fd, F_GETFL, 0) | O_NONBLOCK); */
 
     // Start lisenting on socket fd
     listen(server_socket_fd, INT32_MAX);
@@ -356,77 +357,26 @@ void run_server() {
         }
 
         for (int i = 0; i < new_events; i++) {
-            if (events[i].data.fd == server_socket_fd) {
+            struct sockaddr_in client_addr;
+            socklen_t clilen = sizeof(struct sockaddr);
+            int client_fd = events[i].data.fd;
 
-                struct sockaddr_in client_addr;
-                socklen_t client_addr_len = sizeof(client_addr);
+            int read_length = recvfrom(server_socket_fd, read_buffer,
+                                       sizeof(read_buffer), 0,
+                                       (struct sockaddr *)&client_addr,
+                                       &clilen);
 
-                int new_client_socket =
-                    accept(server_socket_fd, (struct sockaddr *)&client_addr,
-                           &client_addr_len);
-
-                if (new_client_socket < 0) {
-                    perror("New socket connection failed");
-                    continue;
-                }
-
-                // Print info about new connection
-                inet_ntop(AF_INET, (char *)&(client_addr.sin_addr), read_buffer,
-                          sizeof(client_addr));
-                printf("-> connected with %s:%d\n", read_buffer,
-                       ntohs(client_addr.sin_port));
-
-                // Set new client socket fd to nonblocking
-                fcntl(new_client_socket, F_SETFL,
-                      fcntl(new_client_socket, F_GETFL, 0) | O_NONBLOCK);
-
-                // Add client socket to epoll
-                event.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP;
-                event.data.fd = new_client_socket;
-                int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_client_socket,
-                                    &event);
-                if (ret == -1) {
-                    perror("Failed to add new client socket to epoll");
-                    close(new_client_socket);
-                }
-
-            } else if (events[i].events & EPOLLIN) {
-                // Read data from client
-                bzero(read_buffer, sizeof(read_buffer));
-                int client_fd = events[i].data.fd;
-                int bytes_read =
-                    read(client_fd, read_buffer, sizeof(read_buffer));
-
-                if (bytes_read < 0) {
-                    perror("Error reading client message");
-                    close(client_fd);
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
-                } else if (bytes_read > 0) {
-                    printf("-> data: ");
-                    for (int j = 0; j < MESSAGE_SIZE; j++)
-                        printf("%c", read_buffer[j]);
-                    printf("\n");
-                    printf("-> bytes read: %d\n", bytes_read);
-                    ret = write(client_fd, read_buffer, bytes_read);
-
-                    // Close client if unable to write to fd
-                    if (ret < 0) {
-                        perror("Unable to write to client fd");
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd,
-                                  NULL);
-                        close(events[i].data.fd);
-                        printf("-> connection closed\n");
-                    }
-                }
+            if (read_length > 0) {
+              printf("-> data: ");
+              for (int j = 0; j < MESSAGE_SIZE; j++)
+                printf("%c", read_buffer[j]);
+              printf("\n");
+              printf("-> bytes read: %d\n", read_length);
+              (void)sendto(client_fd, read_buffer, read_length, 0,
+                     (struct sockaddr *)&client_addr, sizeof(struct sockaddr));
             }
-            // Check if connection to client is closed
-            if (events[i].events & (EPOLLRDHUP | EPOLLHUP)) {
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
-                close(events[i].data.fd);
-                printf("-> connection closed\n");
-            }
+            bzero(read_buffer, sizeof(read_buffer));
         }
-    }
 
     // Close fds on function exit
     close(server_socket_fd);
