@@ -377,6 +377,7 @@ void run_server() {
             }
             bzero(read_buffer, sizeof(read_buffer));
         }
+    }
 
     // Close fds on function exit
     close(server_socket_fd);
