@@ -62,7 +62,13 @@ typedef struct {
 
     float request_rate;  /* Computed request rate (requests per second) based on
                             RTT and total messages. */
+    
+    long tx_cnt;
+    long rx_cnt;
 } client_thread_data_t;
+
+struct sockaddr_in src_addr;
+socklen_t addr_len = sizeof(src_addr);
 
 /*
  * This function runs in a separate client thread to handle communication with
@@ -78,6 +84,7 @@ void *client_thread_func(void *arg) {
     long long rtt;
     int num_ready, i;
     struct sockaddr_in serverAddr;
+
 
     // Hint 1: register the "connected" client_thread's socket in the its epoll
     // instance Hint 2: use gettimeofday() and "struct timeval start, end" to
@@ -98,7 +105,7 @@ void *client_thread_func(void *arg) {
         return NULL; //Exit client thread
     }
 
-    data->socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_UDP); //Socket creation
+    data->socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); //Socket creation
 
     //If socket is not created exit the thread
     if (data->socket_fd < 0) {
@@ -143,16 +150,24 @@ void *client_thread_func(void *arg) {
 
     data->total_rtt = 0; //Initialize total round trip time
     data->total_messages = 0; //Initialize total messages
+    data->tx_cnt = 0; //Initalizes sent client thread packet count
+    data->rx_cnt = 0; //Initializes recieved client thread packet count
 
     //Run send and recieve messages until there are no more requests
     for (int message_count = 0; message_count < num_requests; message_count++) {
         gettimeofday(&start, NULL); //Get current timestamp to get RTT
-
+        //int returnValue = 0;
         //If sending messages to the server fails
-        if (send(data->socket_fd, send_buf, MESSAGE_SIZE, 0) < 0) {
-            perror("Send failed");
-            break; //Exit
-        }
+        //if (sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,
+          //  (struct sockaddr *)&serverAddr, sizeof(serverAddr))) {
+            //perror("Send failed");
+           // printf("Send to %d", returnValue);
+           // break; //Exit
+       // }
+       // TODO: Deal with return value
+       (void) sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,(struct sockaddr *)&serverAddr, sizeof(serverAddr));
+
+        data->tx_cnt++; //Counts sent message
 
         //Wait for sockets to become readable within 1000 ms
         num_ready =
@@ -167,7 +182,8 @@ void *client_thread_func(void *arg) {
         //Run over the amount epoll waits
         for (i = 0; i < num_ready; i++) {
             if (events[i].events & EPOLLIN) { //If events are being read from the socket
-                if (recv(data->socket_fd, recv_buf, MESSAGE_SIZE, 0) <= 0) { //If messages are being recieved from the server
+                if (recvfrom(data->socket_fd, recv_buf, MESSAGE_SIZE, 0,
+                    (struct sockaddr *)&src_addr, &addr_len) <= 0) { //If messages are being recieved from the server
                     perror("Receive failed");
                     break; //Exit
                 }
@@ -178,7 +194,8 @@ void *client_thread_func(void *arg) {
                       (end.tv_usec - start.tv_usec);
                 data->total_rtt += rtt; //Add onto RTT
                 data->total_messages++; //Add onto total message count
-
+                data->rx_cnt++; //Counts recieved messages
+                
                 printf("RTT: %lld us\n", rtt); //Display RTT for the message
             }
         }
@@ -219,25 +236,12 @@ void run_client() {
      */
 
     for (int i = 0; i < num_client_threads; i++) { //Run through each client thread
-        thread_data[i].socket_fd = socket(AF_INET, SOCK_STREAM, 0); //Create socket for thread
-
-        //If no socket is created for the thread
-        if (thread_data[i].socket_fd < 0) {
-            perror("Created Socket Failed");
-            exit(EXIT_FAILURE); //Exit
-        }
 
         memset(&server_addr, 0, sizeof(server_addr)); //Set server struct to zero
         server_addr.sin_family = AF_INET; //Set server address family to IPv4 internet protocol
         server_addr.sin_port = htons(server_port); //Set server port
 
-        if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) { //Converts Server IP from string to binary
-            perror("Invalid server IP");
-            exit(EXIT_FAILURE); //Exit
-        }
-
         printf("Client %d connected to server\n", i); //Display that the client is connected to the server
-        thread_data[i].epoll_fd = epoll_create(1); //Create epoll for thread
     }
 
     // Hint: use thread_data to save the created socket and epoll instance for
@@ -258,6 +262,8 @@ void run_client() {
     long long total_rtt = 0; //Initialize total round trip time
     long long total_messages = 0; //Initialize total messages
     float total_request_rate = 0; //Initialize request rate
+    long total_tx = 0; //Initialize messages sent
+    long total_rx = 0; //Initialize messages recieved
 
     for (int i = 0; i < num_client_threads; i++) { //Run through each client thread
         total_rtt += thread_data[i].total_rtt; //Add onto total round trip time
@@ -267,6 +273,16 @@ void run_client() {
         close(thread_data[i].epoll_fd); //Close epoll
     }
 
+    for (int i=0; i < num_client_threads; i++)
+    {
+        total_tx += thread_data[i].tx_cnt;
+        total_rx += thread_data[i].rx_cnt;
+    }
+
+    long total_lost = total_tx - total_rx;
+    printf("Total Packets Sent: %ld\n", total_tx);
+    printf("Total Packets Recieved: %ld\n", total_rx);
+    printf("Total Packets Lost: %ld\n", total_lost);
     //If there are messages
     if (total_messages > 0) {
         printf("Average RTT: %lld us\n", total_rtt / total_messages); //Display average RTT
@@ -377,7 +393,7 @@ void run_server() {
             }
             bzero(read_buffer, sizeof(read_buffer));
         }
-
+    }
     // Close fds on function exit
     close(server_socket_fd);
     close(epoll_fd);
