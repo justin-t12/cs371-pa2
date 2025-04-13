@@ -42,6 +42,7 @@ Please specify the group members here
 #define MAX_EVENTS 64
 #define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
+#define MAX_SEQUENCE_NUMBER 1
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -66,6 +67,18 @@ typedef struct {
     long tx_cnt;
     long rx_cnt;
 } client_thread_data_t;
+
+typedef enum {data, ack, nak} frame_type;
+
+/*
+ * Structure of frame being sent between client and server
+ */
+typedef struct {
+    frame_type type;
+    unsigned int seq_num;
+    unsigned int ack_num;
+    unsigned char data[MESSAGE_SIZE];
+} frame;
 
 struct sockaddr_in src_addr;
 socklen_t addr_len = sizeof(src_addr);
