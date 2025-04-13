@@ -113,14 +113,6 @@ void *client_thread_func(void *arg) {
         return NULL;
     }
 
-    //If connection to server fails through the server address, close the socket and exit the thread
-    if (connect(data->socket_fd, (struct sockaddr *)&serverAddr,
-                sizeof(serverAddr)) < 0) {
-        perror("Connection failed");
-        close(data->socket_fd);
-        return NULL;
-    }
-
     /* TODO:
      * The function exits after sending and receiving a predefined number of
      * messages (num_requests). It calculates the request rate based on total
@@ -169,12 +161,15 @@ void *client_thread_func(void *arg) {
 
         data->tx_cnt++; //Counts sent message
 
-        //Wait for sockets to become readable within 1000 ms
+        //Wait for sockets to become readable within 20 ms
         num_ready =
-            epoll_wait(data->epoll_fd, events, MAX_EVENTS, 1000 /*timeout*/);
+            epoll_wait(data->epoll_fd, events, MAX_EVENTS, 20 /*timeout*/);
 
         //If epoll wait fails
-        if (num_ready < 0) {
+        if (num_ready == 0) {
+            break;
+        }
+        else if (num_ready < 0) {
             perror("Epoll wait failed");
             break; //Exit
         }
