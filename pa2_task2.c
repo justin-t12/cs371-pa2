@@ -66,15 +66,18 @@ typedef struct {
     
     long tx_cnt;
     long rx_cnt;
+    unsigned int client_num;
 } client_thread_data_t;
 
-typedef enum {data, ack, nak} frame_type;
+typedef enum {DATA, ACK, NAK} frame_type;
 
 /*
  * Structure of frame being sent between client and server
  */
+
 typedef struct {
     frame_type type;
+    unsigned int client_num;
     unsigned int seq_num;
     unsigned int ack_num;
     unsigned char data[MESSAGE_SIZE];
@@ -97,6 +100,14 @@ void *client_thread_func(void *arg) {
     long long rtt;
     int num_ready, i;
     struct sockaddr_in serverAddr;
+
+    unsigned int seq_num = 0;
+    unsigned int expected_ack = 0;
+    int retransmitting = 0;
+    
+    
+    frame send_frame, recv_frame;
+    memset(&send_frame, 0, sizeof(send_frame));
 
 
     // Hint 1: register the "connected" client_thread's socket in the its epoll
@@ -170,17 +181,31 @@ void *client_thread_func(void *arg) {
            // break; //Exit
        // }
        // TODO: Deal with return value
-       (void) sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,(struct sockaddr *)&serverAddr, sizeof(serverAddr));
+       send_frame.client_num = data->client_num;
+       send_frame.seq_num = seq_num;
+       send_frame.ack_num = 0;
+       send_frame.type = DATA;
+       memcpy(send_frame.data, send_buf, MESSAGE_SIZE);
 
-        data->tx_cnt++; //Counts sent message
+      //(void) sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,(struct sockaddr *)&serverAddr, sizeof(serverAddr));
+      (void)sendto(data->socket_fd, &send_frame, sizeof(frame), 0,
+             (struct sockaddr *)&serverAddr, sizeof(serverAddr));
 
+       if(!retransmitting)
+       {
+        data->tx_cnt++; //Count message
+       }
+        //data->tx_cnt++; //Counts sent message
         //Wait for sockets to become readable within 20 ms
         num_ready =
             epoll_wait(data->epoll_fd, events, MAX_EVENTS, 20 /*timeout*/);
 
         //If epoll wait fails
         if (num_ready == 0) {
-            break;
+            printf("Timeout. Retransmitting from %u...\n", seq_num);
+            retransmitting = 1;
+            continue;
+            //break;
         }
         else if (num_ready < 0) {
             perror("Epoll wait failed");
@@ -190,21 +215,42 @@ void *client_thread_func(void *arg) {
         //Run over the amount epoll waits
         for (i = 0; i < num_ready; i++) {
             if (events[i].events & EPOLLIN) { //If events are being read from the socket
-                if (recvfrom(data->socket_fd, recv_buf, MESSAGE_SIZE, 0,
-                    (struct sockaddr *)&src_addr, &addr_len) <= 0) { //If messages are being recieved from the server
+                if (recvfrom(data->socket_fd, &recv_frame, sizeof(recv_frame), 0,
+                (struct sockaddr *)&src_addr, &addr_len) <= 0) { //If messages are being recieved from the server
                     perror("Receive failed");
                     break; //Exit
                 }
 
-                gettimeofday(&end, NULL); //Get current timestamp to get RTT
-                //Calculate RTT in microseconds
-                rtt = (end.tv_sec - start.tv_sec) * 1000000LL +
-                      (end.tv_usec - start.tv_usec);
-                data->total_rtt += rtt; //Add onto RTT
-                data->total_messages++; //Add onto total message count
-                data->rx_cnt++; //Counts recieved messages
+
                 
-                printf("RTT: %lld us\n", rtt); //Display RTT for the message
+                //Calculate RTT in microseconds
+                if(recv_frame.type == ACK && recv_frame.ack_num == seq_num)
+                {
+                    gettimeofday(&end, NULL); //Get current timestamp to get RTT
+                    rtt = (end.tv_sec - start.tv_sec) * 1000000LL +
+                      (end.tv_usec - start.tv_usec);
+                    data->total_rtt += rtt; //Add onto RTT
+                    data->total_messages++; //Add onto total message count
+                    data->rx_cnt++; //Counts recieved messages
+                    printf("ACK %u recieved. RTT: %lld us\n", recv_frame.ack_num, rtt);
+                    seq_num = 1 - seq_num;
+                    retransmitting = 0;
+                    break;
+                }
+                else if (recv_frame.type == NAK && recv_frame.ack_num == seq_num) {
+                    // If NAK received, retransmit the same packet
+                    printf("NAK received for seq_num %u. Resending...\n", seq_num);
+                    retransmitting = 1;
+                    break; // Retransmit by going back to the start of the loop
+                }
+                else{
+                    printf("Unexpected ACK or packet, retransmitting...\n");
+                    retransmitting = 1;
+                    continue;
+                }
+                
+                
+                //printf("RTT: %lld us\n", rtt); //Display RTT for the message
             }
         }
     }
@@ -251,10 +297,11 @@ void run_client() {
 
         printf("Client %d connected to server\n", i); //Display that the client is connected to the server
     }
-
+    
     // Hint: use thread_data to save the created socket and epoll instance for
     // each thread You will pass the thread_data to pthread_create() as below
     for (int i = 0; i < num_client_threads; i++) {
+        thread_data[i].client_num = i; 
         pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
     }
 
@@ -277,14 +324,10 @@ void run_client() {
         total_rtt += thread_data[i].total_rtt; //Add onto total round trip time
         total_messages += thread_data[i].total_messages; //Add onto total message count
         total_request_rate += thread_data[i].request_rate; //Add onto request rate
-        close(thread_data[i].socket_fd); //Close socket
-        close(thread_data[i].epoll_fd); //Close epoll
-    }
-
-    for (int i=0; i < num_client_threads; i++)
-    {
         total_tx += thread_data[i].tx_cnt;
         total_rx += thread_data[i].rx_cnt;
+        close(thread_data[i].socket_fd); //Close socket
+        close(thread_data[i].epoll_fd); //Close epoll
     }
 
     long total_lost = total_tx - total_rx;
