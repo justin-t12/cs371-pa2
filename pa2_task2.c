@@ -83,6 +83,37 @@ typedef struct {
     unsigned char data[MESSAGE_SIZE];
 } frame;
 
+typedef struct {
+    unsigned int client_num;
+    unsigned int seq_num;
+} client_state;
+
+/*
+** Dynamic array for holding all of the client states
+*/
+typedef struct {
+    client_state *clients;
+    unsigned int count;
+    unsigned int capacity;
+} client_tracker;
+
+/*
+** Macro to add elements and automatically resize the client tracker if needed
+*/
+#define client_tracker_append(array, element)                                  \
+    do {                                                                       \
+        if (array.count >= array.capacity) {                                   \
+            if (array.capacity == 0)                                           \
+                array.capacity = 256;                                          \
+            else                                                               \
+                array.capacity *= 2;                                           \
+            array.clients = realloc(array.clients,                             \
+                                    array.capacity * sizeof(*array.clients));  \
+        }                                                                      \
+        array.clients[array.count++] = element;                                \
+    } while (0)
+
+
 struct sockaddr_in src_addr;
 socklen_t addr_len = sizeof(src_addr);
 
@@ -346,11 +377,6 @@ void run_client() {
 
 void run_server() {
 
-    /* TODO:
-     * Server creates listening socket and epoll instance.
-     * Server registers the listening socket to epoll
-     */
-
     int server_socket_fd, epoll_fd;
     int ret;
     struct sockaddr_in server_addr;
@@ -362,7 +388,8 @@ void run_server() {
     server_addr.sin_addr.s_addr = inet_addr(server_ip);
     server_addr.sin_port = htons(server_port);
 
-    server_socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
+    /* server_socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP); */
+    server_socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
     if (server_socket_fd < 0) {
         perror("Failure to create socket");
@@ -406,14 +433,16 @@ void run_server() {
         exit(EXIT_FAILURE);
     }
 
+    frame recv_frame;
+    struct sockaddr_in client_addr;
+    client_tracker tracker = {0};
+    tracker.count = 0;
+    tracker.capacity= 0;
+
     /* Server's run-to-completion event loop */
     while (1) {
-        /* TODO:
-         * Server uses epoll to handle connection establishment with clients
-         * or receive the message from clients and echo the message back
-         */
 
-        char read_buffer[MESSAGE_SIZE];
+        unsigned char read_buffer[sizeof(frame)];
         int new_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
         if (new_events < 0) {
@@ -424,7 +453,6 @@ void run_server() {
         }
 
         for (int i = 0; i < new_events; i++) {
-            struct sockaddr_in client_addr;
             socklen_t clilen = sizeof(struct sockaddr);
             int client_fd = events[i].data.fd;
 
@@ -433,16 +461,60 @@ void run_server() {
                                        (struct sockaddr *)&client_addr,
                                        &clilen);
 
-            if (read_length > 0) {
-              printf("-> data: ");
-              for (int j = 0; j < MESSAGE_SIZE; j++)
-                printf("%c", read_buffer[j]);
-              printf("\n");
-              printf("-> bytes read: %d\n", read_length);
-              (void)sendto(client_fd, read_buffer, read_length, 0,
-                     (struct sockaddr *)&client_addr, sizeof(struct sockaddr));
+            /* Don't bother with packet if size is incorrect */
+            if ((unsigned long)read_length != sizeof(frame)) {
+                bzero(read_buffer, sizeof(read_buffer));
+                memset(&client_addr, 0, sizeof(client_addr));
+                memset(&recv_frame, 0, sizeof(frame));
+                break;
             }
+
+            recv_frame = *(frame*)read_buffer;
+
+            frame send_frame;
+            if (recv_frame.client_num > (tracker.count - 1) || tracker.count == 0) {
+                client_state new_client;
+                new_client.client_num = recv_frame.client_num;
+                new_client.seq_num = recv_frame.seq_num;
+                client_tracker_append(tracker, new_client);
+                tracker.clients[recv_frame.client_num].seq_num =
+                    ((recv_frame.seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1));
+
+                printf("-> new client\n");
+                send_frame = recv_frame;
+                send_frame.ack_num = recv_frame.seq_num;
+                send_frame.type = ACK;
+
+            } else {
+                unsigned int expected_seq_num =
+                    tracker.clients[recv_frame.client_num].seq_num;
+
+                if (expected_seq_num == recv_frame.seq_num) {
+                    // Increment seq_num to next expected number
+                    tracker.clients[recv_frame.client_num].seq_num =
+                        ((recv_frame.seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1));
+
+                    send_frame = recv_frame;
+                    send_frame.ack_num = recv_frame.seq_num;
+                    send_frame.type = ACK;
+                    printf("-> ack: %d\n", recv_frame.client_num);
+
+                } else {
+                    send_frame.type = NAK;
+                    send_frame.ack_num =
+                        tracker.clients[recv_frame.client_num].seq_num;
+                    printf("-> nak: %d\n", recv_frame.client_num);
+                }
+            }
+
+            (void)sendto(client_fd, &send_frame, sizeof(frame), 0,
+                         (struct sockaddr *)&client_addr,
+                         sizeof(struct sockaddr));
+
+            // reset structs for next loop
             bzero(read_buffer, sizeof(read_buffer));
+            memset(&client_addr, 0, sizeof(client_addr));
+            memset(&recv_frame, 0, sizeof(frame));
         }
     }
     // Close fds on function exit
