@@ -44,7 +44,7 @@ Please specify the group members here
 #define DEFAULT_CLIENT_THREADS 4
 #define MAX_SEQUENCE_NUMBER 1
 #define DEFAULT_CLIENT_COUNT 8
-#define MAX_RETRANSMIT 10
+#define SERVER_PRINT 0
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -100,7 +100,7 @@ typedef struct {
 } client_tracker;
 
 void client_tracker_insert(client_tracker *array, client_state *element, size_t index) {
-    if (index > (array->capacity - 1)) {
+    if (index >= array->capacity) {
         printf("Array out of bounds: %lu is larger than array size %d\n", index, array->capacity);
 
         unsigned long new_capacity = 1;
@@ -117,7 +117,7 @@ void client_tracker_insert(client_tracker *array, client_state *element, size_t 
             exit(EXIT_FAILURE);
         }
 
-        memcpy(new_clients, array->clients, (sizeof(client_state *) * (array->capacity + (1))));
+        memcpy(new_clients, array->clients, (sizeof(client_state *) * array->capacity));
 
         client_state **old_clients = array->clients;
         array->clients = new_clients;
@@ -231,10 +231,9 @@ void *client_thread_func(void *arg) {
     data->rx_cnt = 0; //Initializes recieved client thread packet count
 
     int message_count = 0;
-    int retransmit_num = 0;
     //Run send and recieve messages until there are no more requests
    // for (int message_count = 0; message_count < num_requests; message_count++) {
-   while(message_count < num_requests || retransmit_num < MAX_RETRANSMIT)
+   while(message_count < num_requests)
    {
         gettimeofday(&start, NULL); //Get current timestamp to get RTT
         //int returnValue = 0;
@@ -248,11 +247,12 @@ void *client_thread_func(void *arg) {
        // TODO: Deal with return value
        send_frame.client_num = data->client_num;
        send_frame.seq_num = seq_num;
-       send_frame.ack_num = 0;
+       send_frame.ack_num = seq_num;
        send_frame.type = DATA;
        memcpy(send_frame.data, send_buf, MESSAGE_SIZE);
 
       //(void) sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,(struct sockaddr *)&serverAddr, sizeof(serverAddr));
+      printf("cli:%d, sn:%d\n", data->client_num, send_frame.seq_num);
       (void)sendto(data->socket_fd, &send_frame, sizeof(frame), 0,
              (struct sockaddr *)&serverAddr, sizeof(serverAddr));
 
@@ -260,19 +260,17 @@ void *client_thread_func(void *arg) {
        {
         data->tx_cnt++; //Count message
        }
-        gettimeofday(&start, NULL);
-        sendto(data->socket_fd, &send_frame, sizeof(send_frame), 0,
-               (struct sockaddr *)&serverAddr, sizeof(serverAddr));
-        
-        //data->tx_cnt++; //Counts sent message
+        message_count++;
+
         //Wait for sockets to become readable within 20 ms
         num_ready =
-            epoll_wait(data->epoll_fd, events, MAX_EVENTS, 20 /*timeout*/);
+            epoll_wait(data->epoll_fd, events, MAX_EVENTS, 200 /*timeout*/);
 
         //If epoll wait fails
         if (num_ready == 0) {
             printf("Timeout (%d): Retransmitting from %u...\n", data->client_num, seq_num);
             retransmitting = 1;
+            message_count--;
             continue;
             //break;
         }
@@ -291,7 +289,7 @@ void *client_thread_func(void *arg) {
                 }
 
                 //Calculate RTT in microseconds
-                if(recv_frame.type == ACK && recv_frame.ack_num == (seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1))
+                if(recv_frame.type == ACK && recv_frame.ack_num == ((seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1)))
                 {
                     gettimeofday(&end, NULL); //Get current timestamp to get RTT
                     rtt = (end.tv_sec - start.tv_sec) * 1000000LL +
@@ -302,21 +300,18 @@ void *client_thread_func(void *arg) {
                     printf("ACK %u recieved (%d). RTT: %lld us\n", recv_frame.ack_num, data->client_num ,rtt);
                     seq_num = (seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1);
                     retransmitting = 0;
-                    retransmit_num /= 2;
                     break;
                 }
                 else if (recv_frame.type == NAK && recv_frame.ack_num == seq_num) {
                     // If NAK received, retransmit the same packet
                     printf("NAK received for seq_num %u (%d). Resending...\n", seq_num, data->client_num);
                     retransmitting = 1;
-                    retransmit_num++;
                     message_count--;
                     break; // Retransmit by going back to the start of the loop
                 }
                 else{
-                    printf("Unexpected ACK or packet for %d (%d), retransmitting...\n", seq_num ,data->client_num);
+                    printf("Unexpected ACK or packet for %d (%d) got: %d, retransmitting...\n", seq_num ,data->client_num, recv_frame.seq_num);
                     retransmitting = 1;
-                    retransmit_num++;
                     message_count--;
                     continue;
                 }
@@ -428,6 +423,11 @@ void run_client() {
 
 void run_server() {
 
+#if !SERVER_PRINT
+    printf("Currently server printing is off, if server printing is desired, please\nchange SERVER_PRINT to 1 and recompile\n");
+    fflush(stdout);
+#endif
+
     int server_socket_fd, epoll_fd;
     int ret;
     struct sockaddr_in server_addr;
@@ -533,6 +533,7 @@ void run_server() {
             send_frame.client_num = recv_frame.client_num;
             unsigned int expected_seq = 0;
 
+            //printf("sn:%u\n", recv_frame.seq_num);
             // Client is new
             if (!client_tracker_contains(&tracker, recv_frame.client_num)) {
                 client_state *new_client = calloc(1, sizeof(client_state));
@@ -543,23 +544,39 @@ void run_server() {
                     exit(EXIT_FAILURE);
                 }
                 new_client->client_num = recv_frame.client_num;
+                new_client->seq_num = expected_seq;
                 client_tracker_insert(&tracker, new_client,
                                       recv_frame.client_num);
+#if SERVER_PRINT
                 printf("-> new client: %d\n", new_client->client_num);
+#endif
             } else {
                 expected_seq = tracker.clients[recv_frame.client_num]->seq_num;
+#if SERVER_PRINT
+                printf("expected (t): %u\n", expected_seq);
+#endif
             }
 
             if (expected_seq == recv_frame.seq_num ) {
                 // Send ACK with next seq number
-                send_frame.ack_num =
-                    ((expected_seq + 1) % (MAX_SEQUENCE_NUMBER + 1));
+                send_frame.ack_num = (expected_seq) ? 0 : 1;
+                send_frame.seq_num = (expected_seq) ? 0 : 1;
+#if SERVER_PRINT
+                printf("expected(s): %u\n", expected_seq);
+#endif
                 tracker.clients[recv_frame.client_num]->seq_num =
                     ((recv_frame.seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1));
-                printf("-> ACK: %d | SNS: %d | SNR: %d | NEW: %u\n", recv_frame.client_num, recv_frame.seq_num, send_frame.seq_num, tracker.clients[recv_frame.client_num]->seq_num);
+#if SERVER_PRINT
+                printf("-> ACK: %d | SNC: %d | SNS: %d | NEW: %u\n", recv_frame.client_num, recv_frame.seq_num, send_frame.seq_num, tracker.clients[recv_frame.client_num]->seq_num);
+#endif
             } else {
-                send_frame.ack_num = recv_frame.client_num;
+                send_frame.ack_num =
+                    ((recv_frame.seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1));
+                send_frame.seq_num =
+                    ((recv_frame.seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1));
+#if SERVER_PRINT
                 printf("-> ACK: %d | Duplicate: %d\n", recv_frame.client_num, recv_frame.seq_num);
+#endif
             }
 
             (void)sendto(client_fd, &send_frame, sizeof(frame), 0,
