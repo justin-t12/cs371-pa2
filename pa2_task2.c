@@ -39,8 +39,7 @@ Please specify the group members here
 
 #include <fcntl.h> // fcntl to set fd as non-blocking
 
-/* #define MAX_EVENTS 64 */
-#define MAX_EVENTS 30000
+#define MAX_EVENTS 64
 #define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
 #define MAX_SEQUENCE_NUMBER 1
@@ -516,6 +515,7 @@ void run_server() {
             recv_frame = *(frame*)read_buffer;
 
             frame send_frame;
+            send_frame.type = ACK;
             send_frame.client_num = recv_frame.client_num;
             unsigned int expected_seq = 0;
 
@@ -537,17 +537,15 @@ void run_server() {
             }
 
             if (expected_seq == recv_frame.seq_num ) {
-                send_frame.type = ACK;
-                send_frame.ack_num = recv_frame.seq_num;
+                // Send ACK with next seq number
+                send_frame.ack_num =
+                    ((expected_seq + 1) % (MAX_SEQUENCE_NUMBER + 1));
                 tracker.clients[recv_frame.client_num]->seq_num =
                     ((recv_frame.seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1));
-                printf("-> ACK: %d | SN: %d | NEW: %u\n", recv_frame.client_num, recv_frame.seq_num, tracker.clients[recv_frame.client_num]->seq_num);
+                printf("-> ACK: %d | SNS: %d | SNR: %d | NEW: %u\n", recv_frame.client_num, recv_frame.seq_num, send_frame.seq_num, tracker.clients[recv_frame.client_num]->seq_num);
             } else {
-                send_frame.type = NAK;
-                send_frame.ack_num = expected_seq;
-                tracker.clients[recv_frame.client_num]->seq_num =
-                    expected_seq;
-                printf("-> NAK: %d | Ex: %d\n", recv_frame.client_num, expected_seq);
+                send_frame.ack_num = recv_frame.client_num;
+                printf("-> ACK: %d | Duplicate: %d\n", recv_frame.client_num, recv_frame.seq_num);
             }
 
             (void)sendto(client_fd, &send_frame, sizeof(frame), 0,
