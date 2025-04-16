@@ -39,10 +39,11 @@ Please specify the group members here
 
 #include <fcntl.h> // fcntl to set fd as non-blocking
 
-#define MAX_EVENTS 64
+ #define MAX_EVENTS 64 
 #define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
 #define MAX_SEQUENCE_NUMBER 1
+#define DEFAULT_CLIENT_COUNT 8
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -63,22 +64,85 @@ typedef struct {
 
     float request_rate;  /* Computed request rate (requests per second) based on
                             RTT and total messages. */
-    
+
     long tx_cnt;
     long rx_cnt;
+    unsigned int client_num;
 } client_thread_data_t;
 
-typedef enum {data, ack, nak} frame_type;
+typedef enum {DATA, ACK, NAK} frame_type;
 
 /*
  * Structure of frame being sent between client and server
  */
+
 typedef struct {
     frame_type type;
+    unsigned int client_num;
     unsigned int seq_num;
     unsigned int ack_num;
     unsigned char data[MESSAGE_SIZE];
 } frame;
+
+typedef struct {
+    unsigned int client_num;
+    unsigned int seq_num;
+} client_state;
+
+/*
+** Dynamic array for holding all of the client states
+*/
+typedef struct {
+    client_state **clients;
+    unsigned int count;
+    unsigned int capacity;
+} client_tracker;
+
+void client_tracker_insert(client_tracker *array, client_state *element, size_t index) {
+    if (index > (array->capacity - 1)) {
+        printf("Array out of bounds: %lu is larger than array size %d\n", index, array->capacity);
+
+        unsigned long new_capacity = 1;
+        while (new_capacity < index)
+            new_capacity *= 2;
+        if (new_capacity == index)
+            new_capacity *= 2;
+
+        client_state **new_clients = calloc(new_capacity, sizeof(client_state *));
+        if (new_clients == NULL) {
+            free(array->clients);
+            free(new_clients);
+            perror("calloc failed");
+            exit(EXIT_FAILURE);
+        }
+
+        memcpy(new_clients, array->clients, (sizeof(client_state *) * (array->capacity + (1))));
+
+        client_state **old_clients = array->clients;
+        array->clients = new_clients;
+        array->capacity = new_capacity;
+
+        free(old_clients);
+
+    }
+
+    if (array->clients[index]) {
+        free(array->clients[index]);
+    } else {
+        array->count++;
+    }
+
+    array->clients[index] = element;
+    element->seq_num = -1;
+}
+
+int client_tracker_contains(client_tracker *array, unsigned int client_num) {
+    for (unsigned int i = 0; i < array->capacity; i++) {
+        if (array->clients[i] && array->clients[i]->client_num == client_num)
+            return 1;
+    }
+    return 0;
+}
 
 struct sockaddr_in src_addr;
 socklen_t addr_len = sizeof(src_addr);
@@ -92,11 +156,18 @@ void *client_thread_func(void *arg) {
     struct epoll_event event, events[MAX_EVENTS];
     char send_buf[MESSAGE_SIZE] =
         "ABCDEFGHIJKMLNOP"; /* Send 16-Bytes message every time */
-    char recv_buf[MESSAGE_SIZE];
+    /* char recv_buf[MESSAGE_SIZE]; */
     struct timeval start, end;
     long long rtt;
     int num_ready, i;
     struct sockaddr_in serverAddr;
+
+    unsigned int seq_num = 0;
+    /* unsigned int expected_ack = 0; */
+    int retransmitting = 0;
+
+    frame send_frame, recv_frame;
+    memset(&send_frame, 0, sizeof(send_frame));
 
 
     // Hint 1: register the "connected" client_thread's socket in the its epoll
@@ -170,17 +241,31 @@ void *client_thread_func(void *arg) {
            // break; //Exit
        // }
        // TODO: Deal with return value
-       (void) sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,(struct sockaddr *)&serverAddr, sizeof(serverAddr));
+       send_frame.client_num = data->client_num;
+       send_frame.seq_num = seq_num;
+       send_frame.ack_num = 0;
+       send_frame.type = DATA;
+       memcpy(send_frame.data, send_buf, MESSAGE_SIZE);
 
-        data->tx_cnt++; //Counts sent message
+      //(void) sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,(struct sockaddr *)&serverAddr, sizeof(serverAddr));
+      (void)sendto(data->socket_fd, &send_frame, sizeof(frame), 0,
+             (struct sockaddr *)&serverAddr, sizeof(serverAddr));
 
+       if(!retransmitting)
+       {
+        data->tx_cnt++; //Count message
+       }
+        //data->tx_cnt++; //Counts sent message
         //Wait for sockets to become readable within 20 ms
         num_ready =
             epoll_wait(data->epoll_fd, events, MAX_EVENTS, 20 /*timeout*/);
 
         //If epoll wait fails
         if (num_ready == 0) {
-            break;
+            printf("Timeout (%d): Retransmitting from %u...\n", data->client_num, seq_num);
+            retransmitting = 1;
+            continue;
+            //break;
         }
         else if (num_ready < 0) {
             perror("Epoll wait failed");
@@ -190,21 +275,39 @@ void *client_thread_func(void *arg) {
         //Run over the amount epoll waits
         for (i = 0; i < num_ready; i++) {
             if (events[i].events & EPOLLIN) { //If events are being read from the socket
-                if (recvfrom(data->socket_fd, recv_buf, MESSAGE_SIZE, 0,
-                    (struct sockaddr *)&src_addr, &addr_len) <= 0) { //If messages are being recieved from the server
+                if (recvfrom(data->socket_fd, &recv_frame, sizeof(recv_frame), 0,
+                (struct sockaddr *)&src_addr, &addr_len) <= 0) { //If messages are being recieved from the server
                     perror("Receive failed");
                     break; //Exit
                 }
 
-                gettimeofday(&end, NULL); //Get current timestamp to get RTT
                 //Calculate RTT in microseconds
-                rtt = (end.tv_sec - start.tv_sec) * 1000000LL +
+                if(recv_frame.type == ACK && recv_frame.ack_num == seq_num)
+                {
+                    gettimeofday(&end, NULL); //Get current timestamp to get RTT
+                    rtt = (end.tv_sec - start.tv_sec) * 1000000LL +
                       (end.tv_usec - start.tv_usec);
-                data->total_rtt += rtt; //Add onto RTT
-                data->total_messages++; //Add onto total message count
-                data->rx_cnt++; //Counts recieved messages
-                
-                printf("RTT: %lld us\n", rtt); //Display RTT for the message
+                    data->total_rtt += rtt; //Add onto RTT
+                    data->total_messages++; //Add onto total message count
+                    data->rx_cnt++; //Counts recieved messages
+                    printf("ACK %u recieved (%d). RTT: %lld us\n", recv_frame.ack_num, data->client_num ,rtt);
+                    seq_num = 1 - seq_num;
+                    retransmitting = 0;
+                    break;
+                }
+                else if (recv_frame.type == NAK && recv_frame.ack_num == seq_num) {
+                    // If NAK received, retransmit the same packet
+                    printf("NAK received for seq_num %u (%d). Resending...\n", seq_num, data->client_num);
+                    retransmitting = 1;
+                    break; // Retransmit by going back to the start of the loop
+                }
+                else{
+                    printf("Unexpected ACK or packet for %d (%d), retransmitting...\n", seq_num ,data->client_num);
+                    retransmitting = 1;
+                    continue;
+                }
+
+                //printf("RTT: %lld us\n", rtt); //Display RTT for the message
             }
         }
     }
@@ -218,7 +321,8 @@ void *client_thread_func(void *arg) {
     }
 
     //Display average RTT and request rate for the thread
-    printf("Client thread finished. Avg RTT: %lld us, Request rate: %.2f req/s\n",
+    printf("Client thread finished (%d). Avg RTT: %lld us, Request rate: %.2f req/s\n",
+        data->client_num,
         data->total_messages ? data->total_rtt / data->total_messages : 0,
         data->request_rate);
 
@@ -236,6 +340,7 @@ void *client_thread_func(void *arg) {
 void run_client() {
     pthread_t threads[num_client_threads];
     client_thread_data_t thread_data[num_client_threads];
+    unsigned long missing_packets[num_client_threads];
     struct sockaddr_in server_addr;
 
     /* TODO:
@@ -255,6 +360,7 @@ void run_client() {
     // Hint: use thread_data to save the created socket and epoll instance for
     // each thread You will pass the thread_data to pthread_create() as below
     for (int i = 0; i < num_client_threads; i++) {
+        thread_data[i].client_num = i;
         pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
     }
 
@@ -277,14 +383,11 @@ void run_client() {
         total_rtt += thread_data[i].total_rtt; //Add onto total round trip time
         total_messages += thread_data[i].total_messages; //Add onto total message count
         total_request_rate += thread_data[i].request_rate; //Add onto request rate
-        close(thread_data[i].socket_fd); //Close socket
-        close(thread_data[i].epoll_fd); //Close epoll
-    }
-
-    for (int i=0; i < num_client_threads; i++)
-    {
         total_tx += thread_data[i].tx_cnt;
         total_rx += thread_data[i].rx_cnt;
+        missing_packets[i] = (thread_data[i].tx_cnt - thread_data[i].rx_cnt);
+        close(thread_data[i].socket_fd); //Close socket
+        close(thread_data[i].epoll_fd); //Close epoll
     }
 
     long total_lost = total_tx - total_rx;
@@ -299,14 +402,17 @@ void run_client() {
     }
 
     printf("Total Request Rate: %f messages/s\n", total_request_rate); //Display total request rate
+
+    if (total_lost > 0) {
+        printf("Missing Packets for each\n");
+        for (int i = 0; i < num_client_threads; i++) {
+            if (missing_packets[i])
+                printf("Client: %d | %lu\n", i, missing_packets[i]);
+        }
+    }
 }
 
 void run_server() {
-
-    /* TODO:
-     * Server creates listening socket and epoll instance.
-     * Server registers the listening socket to epoll
-     */
 
     int server_socket_fd, epoll_fd;
     int ret;
@@ -319,7 +425,8 @@ void run_server() {
     server_addr.sin_addr.s_addr = inet_addr(server_ip);
     server_addr.sin_port = htons(server_port);
 
-    server_socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
+    /* server_socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP); */
+    server_socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
     if (server_socket_fd < 0) {
         perror("Failure to create socket");
@@ -363,14 +470,22 @@ void run_server() {
         exit(EXIT_FAILURE);
     }
 
+    frame recv_frame;
+    struct sockaddr_in client_addr;
+    client_tracker tracker;
+    tracker.clients = (client_state **)malloc(sizeof(client_state *) * DEFAULT_CLIENT_COUNT);
+    if (tracker.clients == NULL) {
+        free(tracker.clients);
+        perror("malloc failed");
+        exit(EXIT_FAILURE);
+    }
+
+    tracker.capacity = DEFAULT_CLIENT_COUNT;
+
     /* Server's run-to-completion event loop */
     while (1) {
-        /* TODO:
-         * Server uses epoll to handle connection establishment with clients
-         * or receive the message from clients and echo the message back
-         */
 
-        char read_buffer[MESSAGE_SIZE];
+        unsigned char read_buffer[sizeof(frame)];
         int new_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
         if (new_events < 0) {
@@ -381,7 +496,6 @@ void run_server() {
         }
 
         for (int i = 0; i < new_events; i++) {
-            struct sockaddr_in client_addr;
             socklen_t clilen = sizeof(struct sockaddr);
             int client_fd = events[i].data.fd;
 
@@ -390,21 +504,65 @@ void run_server() {
                                        (struct sockaddr *)&client_addr,
                                        &clilen);
 
-            if (read_length > 0) {
-              printf("-> data: ");
-              for (int j = 0; j < MESSAGE_SIZE; j++)
-                printf("%c", read_buffer[j]);
-              printf("\n");
-              printf("-> bytes read: %d\n", read_length);
-              (void)sendto(client_fd, read_buffer, read_length, 0,
-                     (struct sockaddr *)&client_addr, sizeof(struct sockaddr));
+            /* Don't bother with packet if size is incorrect */
+            if ((unsigned long)read_length != sizeof(frame)) {
+                bzero(read_buffer, sizeof(read_buffer));
+                memset(&client_addr, 0, sizeof(client_addr));
+                memset(&recv_frame, 0, sizeof(frame));
+                break;
             }
+
+            recv_frame = *(frame*)read_buffer;
+
+            frame send_frame;
+            send_frame.client_num = recv_frame.client_num;
+            unsigned int expected_seq = 0;
+
+            // Client is new
+            if (!client_tracker_contains(&tracker, recv_frame.client_num)) {
+                client_state *new_client = calloc(1, sizeof(client_state));
+                if (new_client == NULL) {
+                    free(tracker.clients);
+                    free(new_client);
+                    perror("calloc failed");
+                    exit(EXIT_FAILURE);
+                }
+                new_client->client_num = recv_frame.client_num;
+                client_tracker_insert(&tracker, new_client,
+                                      recv_frame.client_num);
+                printf("-> new client: %d\n", new_client->client_num);
+            } else {
+                expected_seq = tracker.clients[recv_frame.client_num]->seq_num;
+            }
+
+            if (expected_seq == recv_frame.seq_num ) {
+                send_frame.type = ACK;
+                send_frame.ack_num = recv_frame.seq_num;
+                tracker.clients[recv_frame.client_num]->seq_num =
+                    ((recv_frame.seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1));
+                printf("-> ACK: %d | SN: %d | NEW: %u\n", recv_frame.client_num, recv_frame.seq_num, tracker.clients[recv_frame.client_num]->seq_num);
+            } else {
+                send_frame.type = NAK;
+                send_frame.ack_num = expected_seq;
+                tracker.clients[recv_frame.client_num]->seq_num =
+                    expected_seq;
+                printf("-> NAK: %d | Ex: %d\n", recv_frame.client_num, expected_seq);
+            }
+
+            (void)sendto(client_fd, &send_frame, sizeof(frame), 0,
+                         (struct sockaddr *)&client_addr,
+                         sizeof(struct sockaddr));
+
+            // reset structs for next loop
             bzero(read_buffer, sizeof(read_buffer));
+            memset(&client_addr, 0, sizeof(client_addr));
+            memset(&recv_frame, 0, sizeof(frame));
         }
     }
     // Close fds on function exit
     close(server_socket_fd);
     close(epoll_fd);
+    free(tracker.clients);
 }
 
 int main(int argc, char *argv[]) {
@@ -434,3 +592,4 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
