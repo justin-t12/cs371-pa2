@@ -39,12 +39,13 @@ Please specify the group members here
 
 #include <fcntl.h> // fcntl to set fd as non-blocking
 
-/* #define MAX_EVENTS 64 */
-#define MAX_EVENTS 30000
+ #define MAX_EVENTS 64 
+//#define MAX_EVENTS 30000
 #define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
 #define MAX_SEQUENCE_NUMBER 1
 #define DEFAULT_CLIENT_COUNT 8
+#define MAX_RETRANSMIT 10
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -230,8 +231,12 @@ void *client_thread_func(void *arg) {
     data->tx_cnt = 0; //Initalizes sent client thread packet count
     data->rx_cnt = 0; //Initializes recieved client thread packet count
 
+    int message_count = 0;
+    int retransmit_num = 0;
     //Run send and recieve messages until there are no more requests
-    for (int message_count = 0; message_count < num_requests; message_count++) {
+   // for (int message_count = 0; message_count < num_requests; message_count++) {
+   while(message_count < num_requests || retransmit_num < MAX_RETRANSMIT)
+   {
         gettimeofday(&start, NULL); //Get current timestamp to get RTT
         //int returnValue = 0;
         //If sending messages to the server fails
@@ -256,6 +261,10 @@ void *client_thread_func(void *arg) {
        {
         data->tx_cnt++; //Count message
        }
+        gettimeofday(&start, NULL);
+        sendto(data->socket_fd, &send_frame, sizeof(send_frame), 0,
+               (struct sockaddr *)&serverAddr, sizeof(serverAddr));
+        
         //data->tx_cnt++; //Counts sent message
         //Wait for sockets to become readable within 20 ms
         num_ready =
@@ -283,7 +292,7 @@ void *client_thread_func(void *arg) {
                 }
 
                 //Calculate RTT in microseconds
-                if(recv_frame.type == ACK && recv_frame.ack_num == seq_num)
+                if(recv_frame.type == ACK && recv_frame.ack_num == (seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1))
                 {
                     gettimeofday(&end, NULL); //Get current timestamp to get RTT
                     rtt = (end.tv_sec - start.tv_sec) * 1000000LL +
@@ -292,19 +301,24 @@ void *client_thread_func(void *arg) {
                     data->total_messages++; //Add onto total message count
                     data->rx_cnt++; //Counts recieved messages
                     printf("ACK %u recieved (%d). RTT: %lld us\n", recv_frame.ack_num, data->client_num ,rtt);
-                    seq_num = 1 - seq_num;
+                    seq_num = (seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1);
                     retransmitting = 0;
+                    retransmit_num /= 2;
                     break;
                 }
                 else if (recv_frame.type == NAK && recv_frame.ack_num == seq_num) {
                     // If NAK received, retransmit the same packet
                     printf("NAK received for seq_num %u (%d). Resending...\n", seq_num, data->client_num);
                     retransmitting = 1;
+                    retransmit_num++;
+                    message_count--;
                     break; // Retransmit by going back to the start of the loop
                 }
                 else{
                     printf("Unexpected ACK or packet for %d (%d), retransmitting...\n", seq_num ,data->client_num);
                     retransmitting = 1;
+                    retransmit_num++;
+                    message_count--;
                     continue;
                 }
 
