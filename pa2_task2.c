@@ -46,6 +46,7 @@ Please specify the group members here
 #define DEFAULT_CLIENT_COUNT 8
 #define SERVER_PRINT 0
 
+
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
 int num_client_threads = DEFAULT_CLIENT_THREADS;
@@ -101,6 +102,7 @@ typedef struct {
 
 void client_tracker_insert(client_tracker *array, client_state *element, size_t index) {
     if (index >= array->capacity) {
+
         printf("Array out of bounds: %lu is larger than array size %d\n", index, array->capacity);
 
         unsigned long new_capacity = 1;
@@ -248,11 +250,12 @@ void *client_thread_func(void *arg) {
        send_frame.client_num = data->client_num;
        send_frame.seq_num = seq_num;
        send_frame.ack_num = seq_num;
+
        send_frame.type = DATA;
        memcpy(send_frame.data, send_buf, MESSAGE_SIZE);
 
       //(void) sendto(data->socket_fd, send_buf, MESSAGE_SIZE, 0,(struct sockaddr *)&serverAddr, sizeof(serverAddr));
-      printf("cli:%d, sn:%d\n", data->client_num, send_frame.seq_num);
+
       (void)sendto(data->socket_fd, &send_frame, sizeof(frame), 0,
              (struct sockaddr *)&serverAddr, sizeof(serverAddr));
 
@@ -260,6 +263,7 @@ void *client_thread_func(void *arg) {
        {
         data->tx_cnt++; //Count message
        }
+
         message_count++;
 
         //Wait for sockets to become readable within 20 ms
@@ -270,6 +274,7 @@ void *client_thread_func(void *arg) {
         if (num_ready == 0) {
             printf("Timeout (%d): Retransmitting from %u...\n", data->client_num, seq_num);
             retransmitting = 1;
+
             message_count--;
             continue;
             //break;
@@ -289,6 +294,7 @@ void *client_thread_func(void *arg) {
                 }
 
                 //Calculate RTT in microseconds
+
                 if(recv_frame.type == ACK && recv_frame.ack_num == ((seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1)))
                 {
                     gettimeofday(&end, NULL); //Get current timestamp to get RTT
@@ -298,7 +304,9 @@ void *client_thread_func(void *arg) {
                     data->total_messages++; //Add onto total message count
                     data->rx_cnt++; //Counts recieved messages
                     printf("ACK %u recieved (%d). RTT: %lld us\n", recv_frame.ack_num, data->client_num ,rtt);
+
                     seq_num = (seq_num + 1) % (MAX_SEQUENCE_NUMBER + 1);
+
                     retransmitting = 0;
                     break;
                 }
@@ -423,11 +431,11 @@ void run_client() {
 
 void run_server() {
 
+
 #if !SERVER_PRINT
     printf("Currently server printing is off, if server printing is desired, please\nchange SERVER_PRINT to 1 and recompile\n");
     fflush(stdout);
 #endif
-
     int server_socket_fd, epoll_fd;
     int ret;
     struct sockaddr_in server_addr;
@@ -622,3 +630,4 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
